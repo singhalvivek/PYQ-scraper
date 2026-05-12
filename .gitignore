@@ -205,3 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+
+geberate_viewer_data.py
+questions_viewer.html
+viewer_data.json
+scraper_code.zip
+scraper_improved.py

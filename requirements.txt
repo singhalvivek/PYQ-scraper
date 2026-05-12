@@ -1,0 +1,14 @@
+BeautifulSoup4
+requests
+ruff
+python-dotenv
+flask
+flask-cors
+flask-smorest
+marshmallow
+flask_swagger_ui
+psycopg2-binary
+psycopg[binary,pool]
+pymongo[srv]==3.12
+boto3
+certifi
