@@ -3,11 +3,13 @@ from bs4 import BeautifulSoup
 import json
 import html
 import re
+import hashlib
 from pathlib import Path
 from urllib.parse import urljoin
 import os
 import boto3
 from pymongo import MongoClient
+from bson import ObjectId
 import certifi
 from dotenv import load_dotenv
 import io
@@ -36,12 +38,14 @@ CONNECTION_STRING = os.getenv("CONNECTION_STRING")
 db_client = None
 db = None
 questions_collection = None
+comprehensions_collection = None
 
 if CONNECTION_STRING:
     db_client = MongoClient(CONNECTION_STRING, tlsCAFile=certifi.where())
     # Using the db name from connection string if present, otherwise default to StudyNaksha
     db = db_client.get_database("StudyNaksha")
     questions_collection = db.get_collection("questions")
+    comprehensions_collection = db.get_collection("comprehensions")
 
 # Catalog Mapping based on provided HTML
 CATALOG = {
@@ -269,17 +273,58 @@ def scrape_explanation_page(url):
     return explanation
 
 def parse_card(card, subject_name, topic_name, idx, page_url=BASE_URL):
+    """Parse a question card. Returns (doc, comprehension_data_or_None).
+    comprehension_data is a dict with 'text' and 'imageUrls' if the card has a comprehension passage."""
+    
     titles = card.select("h4.card-title")
+    
+    # Detect comprehension: look for <h3 class="text-danger">Comprehension</h3>
+    has_comprehension = False
+    comp_header = card.find("h3", class_="text-danger")
+    if comp_header and "comprehension" in comp_header.get_text(strip=True).lower():
+        has_comprehension = True
+    
+    comprehension_data = None
     question_text = None
     question_images_raw = []
     
-    for title in titles:
-        text, images = extract_images_and_text(title)
-        if images: question_images_raw.extend(images)
-        if text and text != "N/A" and text != "":
-            math_text = extract_text_with_math(title)
-            if math_text and math_text != "N/A":
-                question_text = math_text if not question_text else question_text + " " + math_text
+    if has_comprehension and len(titles) >= 2:
+        # Title 0 = passage, Title 1 = actual question
+        passage_title = titles[0]
+        question_title = titles[1]
+        
+        # Extract passage
+        passage_text = extract_text_with_math(passage_title)
+        _, passage_images = extract_images_and_text(passage_title)
+        
+        # Only treat as real comprehension if passage has meaningful content
+        # (Fundamaker puts "Comprehension" header on ALL cards, even plain QA 
+        # questions where the first title is just "N/A" or empty)
+        has_real_passage = (passage_text and passage_text.strip() != "N/A" 
+                           and len(passage_text.strip()) > 10) or len(passage_images) > 0
+        
+        if has_real_passage:
+            passage_image_urls = fix_and_upload_images(passage_images)
+            comprehension_data = {
+                "text": passage_text if passage_text else None,
+                "imageUrls": passage_image_urls
+            }
+        
+        # Extract question
+        q_text, q_images = extract_images_and_text(question_title)
+        if q_images: question_images_raw.extend(q_images)
+        math_text = extract_text_with_math(question_title)
+        if math_text and math_text != "N/A":
+            question_text = math_text
+    else:
+        # Non-comprehension card: all titles are question text
+        for title in titles:
+            text, images = extract_images_and_text(title)
+            if images: question_images_raw.extend(images)
+            if text and text != "N/A" and text != "":
+                math_text = extract_text_with_math(title)
+                if math_text and math_text != "N/A":
+                    question_text = math_text if not question_text else question_text + " " + math_text
                 
     question_image_urls = fix_and_upload_images(question_images_raw)
 
@@ -320,7 +365,13 @@ def parse_card(card, subject_name, topic_name, idx, page_url=BASE_URL):
                 break
 
     qid_tag = card.select_one("[questionid]")
-    external_id = qid_tag.get("questionid", f"gen_{idx}") if qid_tag else f"gen_{idx}"
+    if qid_tag:
+        external_id = qid_tag.get("questionid", "")
+    
+    if not qid_tag or not external_id:
+        # Generate a stable ID from question text so upserts work across runs
+        id_source = (question_text or "") + subject_name + topic_name
+        external_id = "auto_" + hashlib.md5(id_source.encode("utf-8")).hexdigest()[:12]
     
     meta = card.select_one(".muted-text")
     meta_text = extract_text_with_math(meta) if meta else ""
@@ -347,12 +398,49 @@ def parse_card(card, subject_name, topic_name, idx, page_url=BASE_URL):
     else:
         doc["correctAnswer"] = correct_answer
 
-    return doc
+    return doc, comprehension_data
+
+def get_comprehension_hash(comp_data):
+    """Generate a hash from comprehension text to deduplicate passages."""
+    text = comp_data.get("text") or ""
+    # Use first 500 chars for hashing — enough to uniquely identify a passage
+    return hashlib.md5(text[:500].encode("utf-8")).hexdigest()
+
+def get_or_create_comprehension(comp_data, subject_name, topic_name, comp_hash_cache):
+    """Find or create a comprehension document. Returns the ObjectId."""
+    comp_hash = get_comprehension_hash(comp_data)
+    
+    # Check in-memory cache first
+    if comp_hash in comp_hash_cache:
+        return comp_hash_cache[comp_hash]
+    
+    if comprehensions_collection is not None:
+        # Check if it already exists in DB
+        existing = comprehensions_collection.find_one({"hash": comp_hash})
+        if existing:
+            comp_hash_cache[comp_hash] = existing["_id"]
+            return existing["_id"]
+        
+        # Insert new comprehension
+        comp_doc = {
+            "text": comp_data.get("text"),
+            "imageUrls": comp_data.get("imageUrls", []),
+            "subject": subject_name,
+            "topic": topic_name,
+            "hash": comp_hash
+        }
+        result = comprehensions_collection.insert_one(comp_doc)
+        comp_hash_cache[comp_hash] = result.inserted_id
+        print(f"  [NEW COMPREHENSION] Created comprehension {result.inserted_id}")
+        return result.inserted_id
+    
+    return None
 
 def scrape_topic(s_id, t_id, subject_name, topic_name):
     page = 1
     total_scraped = 0
     seen_ids = set()
+    comp_hash_cache = {}  # hash -> ObjectId, for deduplicating comprehensions within a topic
     
     while True:
         url = f"{BASE_URL}?s={s_id}&t={t_id}&page={page}"
@@ -376,13 +464,19 @@ def scrape_topic(s_id, t_id, subject_name, topic_name):
         new_cards_on_page = 0
         for idx, card in enumerate(valid_cards):
             try:
-                doc = parse_card(card, subject_name, topic_name, idx, url)
+                doc, comp_data = parse_card(card, subject_name, topic_name, idx, url)
                 
                 # Check for infinite loop pagination
                 if doc["externalId"] in seen_ids:
                     continue
                 seen_ids.add(doc["externalId"])
                 new_cards_on_page += 1
+                
+                # Handle comprehension linking
+                if comp_data is not None:
+                    comp_id = get_or_create_comprehension(comp_data, subject_name, topic_name, comp_hash_cache)
+                    if comp_id:
+                        doc["comprehensionId"] = comp_id
                 
                 # Insert into DB
                 if questions_collection is not None:
@@ -437,6 +531,14 @@ def run_scraper():
         print("Warning: MongoDB CONNECTION_STRING not set. Will skip saving.")
     if not s3_client:
         print("Warning: AWS Credentials not set. Images will not be uploaded to S3.")
+
+    # Cleanup: remove old gen_ entries from previous runs.
+    # These had passage+question text mixed together. The re-scrape will
+    # recreate them with proper separated text and stable auto_ IDs.
+    if questions_collection is not None:
+        result = questions_collection.delete_many({"externalId": {"$regex": "^gen_"}})
+        if result.deleted_count > 0:
+            print(f"[CLEANUP] Removed {result.deleted_count} old 'gen_' entries. They will be re-scraped with proper comprehension separation.")
 
     total_all = 0
     for s_id, subject_data in CATALOG.items():
